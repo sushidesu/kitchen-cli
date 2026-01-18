@@ -13,6 +13,7 @@ impl Cli {
     pub fn run(self) {
         match self.command {
             Command::Hello(args) => args.run(),
+            Command::Notify(args) => args.run(),
         }
     }
 }
@@ -21,4 +22,6 @@ impl Cli {
 enum Command {
     /// Print a greeting
     Hello(commands::hello::HelloArgs),
+    /// Show a macOS notification
+    Notify(commands::notify::NotifyArgs),
 }
