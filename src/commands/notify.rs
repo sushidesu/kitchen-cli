@@ -17,12 +17,13 @@ pub struct NotifyArgs {
 
 impl NotifyArgs {
     pub fn run(self) {
-        let script = build_script(&self.message, self.title.as_deref(), self.subtitle.as_deref());
+        let script = build_script(
+            &self.message,
+            self.title.as_deref(),
+            self.subtitle.as_deref(),
+        );
 
-        let status = Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .status();
+        let status = Command::new("osascript").arg("-e").arg(script).status();
 
         if let Err(err) = status {
             eprintln!("Failed to send notification: {err}");
