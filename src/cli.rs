@@ -14,6 +14,7 @@ impl Cli {
         match self.command {
             Command::Hello(args) => args.run(),
             Command::Notify(args) => args.run(),
+            Command::Repo(args) => args.run(),
         }
     }
 }
@@ -24,4 +25,6 @@ enum Command {
     Hello(commands::hello::HelloArgs),
     /// Show a macOS notification
     Notify(commands::notify::NotifyArgs),
+    /// Incrementally search git repositories
+    Repo(commands::repo::RepoArgs),
 }

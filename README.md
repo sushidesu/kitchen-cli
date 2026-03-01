@@ -23,6 +23,7 @@ mise use -g cargo:sushidesu/kitchen-cli
 ```bash
 kitchen hello
 kitchen hello kitchen
+kitchen repo
 ```
 
 ## Usage
@@ -33,6 +34,27 @@ kitchen hello kitchen
 # Print a greeting
 kitchen hello
 kitchen hello kitchen
+
+# Incrementally search git repositories
+kitchen repo
+kitchen repo ~/dev
+kitchen repo ~/dev ~/work
+```
+
+`kitchen repo` scans for git repositories under the given paths and starts an interactive
+incremental selector in the terminal. It prints the selected repository path to stdout.
+
+Search roots are resolved in this order:
+
+1. Positional `PATH` arguments (`kitchen repo [path ...]`)
+2. `~/.config/kitchen/config.toml` (`[repo].roots`)
+3. Current directory (fallback when roots are empty)
+
+Config example:
+
+```toml
+[repo]
+roots = ["/Users/you/dev", "/Users/you/work"]
 ```
 
 ## Development
