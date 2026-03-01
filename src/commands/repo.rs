@@ -1,11 +1,22 @@
 use clap::Args;
+use crossterm::cursor;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::queue;
+use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
+use crossterm::terminal::{self, ClearType};
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_SCAN_DEPTH: usize = 4;
-const MAX_DISPLAY_CANDIDATES: usize = 20;
+const MIN_VISIBLE_CANDIDATES: usize = 6;
+const MAX_VISIBLE_CANDIDATES: usize = 20;
+const MATCH_FG: Color = Color::DarkYellow;
+const MARKER_FG: Color = MATCH_FG;
+const SELECTED_FG: Color = Color::White;
 const SKIP_DIR_NAMES: &[&str] = &[
     ".git",
     "node_modules",
@@ -170,17 +181,15 @@ fn normalize_path(input: &str, cwd: &Path, home: Option<&Path>) -> Result<PathBu
 }
 
 fn expand_home(input: &str, home: Option<&Path>) -> Result<String, String> {
-    if input == "~" {
-        let home = home.ok_or_else(|| "kitchen repo: HOME is not set".to_string())?;
-        return Ok(home.display().to_string());
+    if !input.starts_with('~') {
+        return Ok(input.to_string());
     }
-
+    let home = home.ok_or_else(|| "kitchen repo: HOME is not set".to_string())?;
     if let Some(rest) = input.strip_prefix("~/") {
-        let home = home.ok_or_else(|| "kitchen repo: HOME is not set".to_string())?;
-        return Ok(home.join(rest).display().to_string());
+        Ok(home.join(rest).display().to_string())
+    } else {
+        Ok(home.display().to_string())
     }
-
-    Ok(input.to_string())
 }
 
 fn collect_repositories(roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -240,76 +249,405 @@ fn should_skip_dir(path: &Path) -> bool {
     SKIP_DIR_NAMES.contains(&name)
 }
 
-fn select_incrementally(repositories: &[PathBuf]) -> Result<Option<PathBuf>, String> {
-    let mut query = String::new();
+#[derive(Debug, Clone)]
+struct Candidate {
+    path: PathBuf,
+    text: String,
+    lower: String,
+}
 
-    loop {
-        let filtered = filter_repositories(repositories, &query);
-
-        eprintln!();
-        if query.is_empty() {
-            eprintln!("kitchen repo: repositories");
-        } else {
-            eprintln!("kitchen repo: repositories (query: {query})");
-        }
-
-        if filtered.is_empty() {
-            eprintln!("  no matches");
-        } else {
-            for (index, path) in filtered.iter().take(MAX_DISPLAY_CANDIDATES).enumerate() {
-                eprintln!("{:>2}. {}", index + 1, path.display());
-            }
-            if filtered.len() > MAX_DISPLAY_CANDIDATES {
-                eprintln!("  ... and {} more", filtered.len() - MAX_DISPLAY_CANDIDATES);
-            }
-        }
-
-        eprintln!("input query to refine, number to select, or empty line to cancel:");
-
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| format!("kitchen repo: failed to read input: {e}"))?;
-        let input = input.trim();
-
-        if input.is_empty() {
-            return Ok(None);
-        }
-
-        if let Ok(index) = input.parse::<usize>() {
-            if index == 0 || index > filtered.len() {
-                eprintln!("kitchen repo: invalid selection index: {index}");
-                continue;
-            }
-            return Ok(Some(filtered[index - 1].clone()));
-        }
-
-        query = input.to_string();
+impl Candidate {
+    fn new(path: PathBuf) -> Self {
+        let text = path.display().to_string();
+        let lower = text.to_lowercase();
+        Self { path, text, lower }
     }
 }
 
-fn filter_repositories(repositories: &[PathBuf], query: &str) -> Vec<PathBuf> {
-    let normalized_query = query.trim().to_lowercase();
-    if normalized_query.is_empty() {
-        return repositories.to_vec();
+#[derive(Debug, Clone)]
+struct MatchScore {
+    index: usize,
+    score: i64,
+    positions: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct SelectorState {
+    query: String,
+    query_terms: Vec<String>,
+    selected: usize,
+    scroll: usize,
+    visible_rows: usize,
+    matches: Vec<MatchScore>,
+}
+
+impl SelectorState {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            query_terms: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            visible_rows: MAX_VISIBLE_CANDIDATES,
+            matches: Vec::new(),
+        }
     }
 
-    let terms: Vec<&str> = normalized_query.split_whitespace().collect();
-    repositories
+    fn refresh_matches(&mut self, candidates: &[Candidate]) {
+        self.query_terms = self.query.split_whitespace().map(|t| t.to_lowercase()).collect();
+        self.matches = fuzzy_match_candidates(candidates, &self.query_terms);
+        if self.selected >= self.matches.len() {
+            self.selected = self.matches.len().saturating_sub(1);
+        }
+        self.adjust_scroll();
+    }
+
+    fn move_up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+            self.adjust_scroll();
+        }
+    }
+
+    fn move_down(&mut self) {
+        if self.selected + 1 < self.matches.len() {
+            self.selected += 1;
+            self.adjust_scroll();
+        }
+    }
+
+    fn adjust_scroll(&mut self) {
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        }
+
+        let window_end = self.scroll + self.visible_rows;
+        if self.selected >= window_end {
+            self.scroll = self.selected + 1 - self.visible_rows;
+        }
+    }
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Result<Self, String> {
+        terminal::enable_raw_mode()
+            .map_err(|e| format!("kitchen repo: failed to enable raw mode: {e}"))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn select_incrementally(repositories: &[PathBuf]) -> Result<Option<PathBuf>, String> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err("kitchen repo: interactive mode requires a TTY".to_string());
+    }
+
+    let candidates: Vec<Candidate> = repositories
         .iter()
-        .filter(|path| {
-            let haystack = path.to_string_lossy().to_lowercase();
-            terms.iter().all(|term| haystack.contains(term))
-        })
-        .cloned()
-        .collect()
+        .map(|p| Candidate::new(p.clone()))
+        .collect();
+
+    let _raw_mode = RawModeGuard::new()?;
+    let mut stderr = io::stderr();
+    let mut state = SelectorState::new();
+    state.visible_rows = visible_rows();
+    state.refresh_matches(&candidates);
+
+    loop {
+        draw_selector(&mut stderr, &state, &candidates)?;
+
+        let event =
+            event::read().map_err(|e| format!("kitchen repo: failed to read key event: {e}"))?;
+
+        match event {
+            Event::Resize(_, _) => {
+                state.visible_rows = visible_rows();
+                state.adjust_scroll();
+            }
+            Event::Key(key) => {
+                if !should_handle_key(key) {
+                    continue;
+                }
+
+                if is_cancel_key(key) {
+                    clear_selector(&mut stderr)?;
+                    return Ok(None);
+                }
+
+                match key {
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } => {
+                        clear_selector(&mut stderr)?;
+                        let Some(selected) = state.matches.get(state.selected) else {
+                            return Ok(None);
+                        };
+                        return Ok(Some(candidates[selected.index].path.clone()));
+                    }
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } => {
+                        state.move_up();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    } => {
+                        state.move_down();
+                    }
+                    KeyEvent {
+                        code: KeyCode::Backspace,
+                        ..
+                    } => {
+                        state.query.pop();
+                        state.refresh_matches(&candidates);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char(ch),
+                        modifiers,
+                        ..
+                    } if modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT => {
+                        state.query.push(ch);
+                        state.refresh_matches(&candidates);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn should_handle_key(key: KeyEvent) -> bool {
+    match key.kind {
+        KeyEventKind::Press | KeyEventKind::Repeat => true,
+        KeyEventKind::Release => false,
+    }
+}
+
+fn is_cancel_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn visible_rows() -> usize {
+    let rows = terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
+    let reserved = 4usize;
+    rows.saturating_sub(reserved)
+        .clamp(MIN_VISIBLE_CANDIDATES, MAX_VISIBLE_CANDIDATES)
+}
+
+fn render_err(e: impl std::fmt::Display) -> String {
+    format!("kitchen repo: failed to render selector: {e}")
+}
+
+fn reset_screen(stderr: &mut io::Stderr) -> Result<(), String> {
+    queue!(stderr, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All)).map_err(render_err)
+}
+
+fn draw_selector(
+    stderr: &mut io::Stderr,
+    state: &SelectorState,
+    candidates: &[Candidate],
+) -> Result<(), String> {
+    reset_screen(stderr)?;
+
+    write_line(stderr, &format!("repo> {}", state.query))?;
+    write_line(
+        stderr,
+        &format!("matches: {} / {}", state.matches.len(), candidates.len()),
+    )?;
+
+    if state.matches.is_empty() {
+        write_line(stderr, "  (no matches)")?;
+    } else {
+        let end = (state.scroll + state.visible_rows).min(state.matches.len());
+        for row in state.scroll..end {
+            let matched = &state.matches[row];
+            write_candidate_line(
+                stderr,
+                &candidates[matched.index],
+                &matched.positions,
+                row == state.selected,
+            )?;
+        }
+    }
+
+    write_line(
+        stderr,
+        "[Enter] select  [Esc/Ctrl-C] cancel  [Up/Down] move",
+    )?;
+
+    stderr
+        .flush()
+        .map_err(|e| format!("kitchen repo: failed to flush selector: {e}"))
+}
+
+fn write_line(stderr: &mut io::Stderr, line: &str) -> Result<(), String> {
+    write!(stderr, "{line}\r\n")
+        .map_err(|e| format!("kitchen repo: failed to render selector: {e}"))
+}
+
+fn write_candidate_line(
+    stderr: &mut io::Stderr,
+    candidate: &Candidate,
+    match_positions: &[usize],
+    selected: bool,
+) -> Result<(), String> {
+    let text = &candidate.text;
+    let marker = if selected { '>' } else { ' ' };
+
+    queue!(
+        stderr,
+        SetAttribute(Attribute::NormalIntensity),
+        SetForegroundColor(Color::Reset)
+    )
+    .map_err(render_err)?;
+
+    if selected {
+        queue!(
+            stderr,
+            SetAttribute(Attribute::Bold),
+            SetForegroundColor(MARKER_FG)
+        )
+        .map_err(render_err)?;
+    }
+    write!(stderr, "{marker}").map_err(render_err)?;
+    if selected {
+        queue!(stderr, SetForegroundColor(SELECTED_FG)).map_err(render_err)?;
+    } else {
+        queue!(stderr, SetForegroundColor(Color::Reset)).map_err(render_err)?;
+    }
+    write!(stderr, " ").map_err(render_err)?;
+
+    for (idx, ch) in text.chars().enumerate() {
+        if match_positions.binary_search(&idx).is_ok() {
+            queue!(stderr, SetForegroundColor(MATCH_FG)).map_err(render_err)?;
+        } else if selected {
+            queue!(stderr, SetForegroundColor(SELECTED_FG)).map_err(render_err)?;
+        } else {
+            queue!(stderr, SetForegroundColor(Color::Reset)).map_err(render_err)?;
+        }
+        write!(stderr, "{ch}").map_err(render_err)?;
+    }
+
+    queue!(
+        stderr,
+        SetAttribute(Attribute::NormalIntensity),
+        SetForegroundColor(Color::Reset)
+    )
+    .map_err(render_err)?;
+    write!(stderr, "\r\n").map_err(render_err)
+}
+
+fn clear_selector(stderr: &mut io::Stderr) -> Result<(), String> {
+    reset_screen(stderr)?;
+    stderr
+        .flush()
+        .map_err(|e| format!("kitchen repo: failed to flush selector: {e}"))
+}
+
+fn fuzzy_match_candidates(candidates: &[Candidate], terms: &[String]) -> Vec<MatchScore> {
+    let mut scored = Vec::new();
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        let maybe_total = terms
+            .iter()
+            .try_fold(0i64, |acc, term| fuzzy_score(&candidate.lower, term).map(|s| acc + s));
+        if let Some(total) = maybe_total {
+            let positions = match_positions_for_terms(&candidate.lower, terms);
+            scored.push(MatchScore {
+                index,
+                score: total - candidate.lower.len() as i64,
+                positions,
+            });
+        }
+    }
+
+    scored.sort_by_key(|m| {
+        (
+            Reverse(m.score),
+            candidates[m.index].lower.len(),
+            &candidates[m.index].lower,
+        )
+    });
+
+    scored
+}
+
+fn match_positions_for_terms(haystack: &str, terms: &[String]) -> Vec<usize> {
+    let mut positions = Vec::new();
+    for term in terms {
+        let Some(matched) = fuzzy_match_positions(haystack, term) else {
+            return Vec::new();
+        };
+        positions.extend(matched);
+    }
+    positions.sort_unstable();
+    positions.dedup();
+    positions
+}
+
+fn find_subsequence(h: &[char], q: &[char]) -> Option<Vec<usize>> {
+    let mut cursor = 0;
+    let mut positions = Vec::with_capacity(q.len());
+    for &needle in q {
+        let pos = h[cursor..].iter().position(|&ch| ch == needle)? + cursor;
+        positions.push(pos);
+        cursor = pos + 1;
+    }
+    Some(positions)
+}
+
+fn fuzzy_match_positions(haystack: &str, query: &str) -> Option<Vec<usize>> {
+    if query.is_empty() {
+        return Some(Vec::new());
+    }
+    let h: Vec<char> = haystack.chars().collect();
+    let q: Vec<char> = query.chars().collect();
+    find_subsequence(&h, &q)
+}
+
+fn fuzzy_score(haystack: &str, query: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let h: Vec<char> = haystack.chars().collect();
+    let q: Vec<char> = query.chars().collect();
+    let positions = find_subsequence(&h, &q)?;
+
+    let mut score = (positions.len() as i64) * 10;
+    for (i, &pos) in positions.iter().enumerate() {
+        if i > 0 && pos == positions[i - 1] + 1 {
+            score += 15;
+        }
+        if pos == 0 || is_word_boundary(h[pos - 1]) {
+            score += 8;
+        }
+    }
+    if let Some(&first) = positions.first() {
+        score += 25 - (first as i64).min(25);
+    }
+    Some(score)
+}
+
+fn is_word_boundary(ch: char) -> bool {
+    matches!(ch, '/' | '-' | '_' | '.' | ' ')
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_home, filter_repositories, is_git_repository, parse_repo_roots_from_config,
-        resolve_roots,
+        expand_home, fuzzy_match_candidates, fuzzy_match_positions, fuzzy_score, is_git_repository,
+        match_positions_for_terms, parse_repo_roots_from_config, resolve_roots,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -373,14 +711,43 @@ mod tests {
     }
 
     #[test]
-    fn filter_repositories_matches_all_query_terms() {
-        let repositories = vec![
-            PathBuf::from("/Users/test/dev/kitchen-cli"),
-            PathBuf::from("/Users/test/dev/dotfiles"),
+    fn fuzzy_score_matches_subsequence() {
+        assert!(fuzzy_score("/users/me/dev/kitchen-cli", "ktcn").is_some());
+        assert!(fuzzy_score("/users/me/dev/kitchen-cli", "zzz").is_none());
+    }
+
+    #[test]
+    fn fuzzy_match_positions_returns_character_indices() {
+        let positions = fuzzy_match_positions("kitchen-cli", "kcn").expect("should match");
+        assert_eq!(positions, vec![0, 3, 6]);
+    }
+
+    #[test]
+    fn match_positions_for_terms_merges_terms() {
+        let terms = vec!["kit".to_string(), "cli".to_string()];
+        let positions = match_positions_for_terms("/users/me/dev/kitchen-cli", &terms);
+        assert!(!positions.is_empty());
+        assert!(positions.contains(&14));
+    }
+
+    #[test]
+    fn fuzzy_match_candidates_ranks_better_match_first() {
+        let candidates = vec![
+            super::Candidate {
+                path: PathBuf::from("/users/me/dev/kitchen-cli"),
+                text: "/users/me/dev/kitchen-cli".to_string(),
+                lower: "/users/me/dev/kitchen-cli".to_string(),
+            },
+            super::Candidate {
+                path: PathBuf::from("/users/me/dev/kitten"),
+                text: "/users/me/dev/kitten".to_string(),
+                lower: "/users/me/dev/kitten".to_string(),
+            },
         ];
 
-        let filtered = filter_repositories(&repositories, "dev kitchen");
-        assert_eq!(filtered, vec![PathBuf::from("/Users/test/dev/kitchen-cli")]);
+        let terms = vec!["kitchen".to_string()];
+        let scored = fuzzy_match_candidates(&candidates, &terms);
+        assert_eq!(scored[0].index, 0);
     }
 
     #[test]

@@ -43,6 +43,15 @@ kitchen repo ~/dev ~/work
 
 `kitchen repo` scans for git repositories under the given paths and starts an interactive
 incremental selector in the terminal. It prints the selected repository path to stdout.
+The selector supports real-time filtering with keyboard input.
+
+Interactive keys:
+
+- Type text: refine candidates immediately (fuzzy match)
+- `Backspace`: delete one character from query
+- `Up` / `Down`: move selection
+- `Enter`: select and print path
+- `Esc` / `Ctrl-C`: cancel
 
 Search roots are resolved in this order:
 
